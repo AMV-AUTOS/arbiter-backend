@@ -1,22 +1,45 @@
 import { config } from './config.js';
+import { recordAuditEntry } from './auditLog.js';
 
 /**
- * Gate for every /admin/* route. Deliberately a single shared bearer
- * token, not a session/account system — see config.js's `admin` block for
- * why. Refuses every request (rather than failing open) when ADMIN_TOKEN
- * is unset, so an operator can't accidentally ship this surface wide open
- * by forgetting to configure it.
+ * Single shared bearer-token gate for every /admin/* route. There is no
+ * per-caller identity today (that's #131's job), so the audit log records
+ * only that an action occurred and which route/status it produced.
  */
 export function requireAdmin(req, res, next) {
-  if (!config.admin.token) {
-    return res.status(503).json({ error: 'admin console not configured (ADMIN_TOKEN unset)' });
+  const header = req.headers['authorization'] || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+
+  if (!config.adminToken) {
+    // Fail closed: no configured token means admin is unavailable, not open.
+    recordAuditEntry({
+      route: req.path,
+      method: req.method,
+      status: 503,
+      requestId: req.id,
+    }).catch(() => {});
+    return res.status(503).json({ error: 'admin_unavailable' });
   }
 
-  const header = req.get('authorization') || '';
-  const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || token !== config.admin.token) {
+  if (!token || token !== config.adminToken) {
+    recordAuditEntry({
+      route: req.path,
+      method: req.method,
+      status: 401,
+      requestId: req.id,
+    }).catch(() => {});
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  next();
+  // Record the successful admin call. The handler's own status isn't known
+  // yet, so the gate records the authorization outcome (200) — the durable
+  // record proves the call was made and authorized.
+  recordAuditEntry({
+    route: req.path,
+    method: req.method,
+    status: 200,
+    requestId: req.id,
+  }).catch(() => {});
+
+  return next();
 }

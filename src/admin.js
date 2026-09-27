@@ -6,9 +6,46 @@ import { getStakeOnChain, getOwedOnChain } from './stellarClient.js';
 import { getHorizon } from './sponsor.js';
 import { config } from './config.js';
 import { stroopsToUsdc } from './pricing.js';
+import { jobLogger } from './logger.js';
 
 const PLATFORM_FEE_BPS = 2000n; // mirrors contracts/oracle-escrow/src/lib.rs's PLATFORM_FEE_BPS
 const BPS_DENOM = 10_000n;
+
+/** Durable, listable audit store for /admin/* actions. Follows jobs.js's
+ * append-and-index pattern: one record per action plus a bounded index used
+ * for listing. Kept in-memory here (same durability model as the rest of
+ * this backend's stores) so an operator can query recent admin activity
+ * rather than only the transient pino request line. */
+const AUDIT_LOG_MAX = 1000;
+const auditLog = [];
+
+/** Records a single /admin/* call. Called for every admin route invocation,
+ * including rejected (401/503) ones, so the log can't be gamed by a caller
+ * who knows a call will fail. Emits a jobLogger()-style child log line for
+ * live tailing and appends a durable record for the /admin/audit-log listing. */
+export function recordAdminAction({ route, method, status, actor = 'shared-token' } = {}) {
+  const entry = {
+    timestamp: Date.now(),
+    route,
+    method,
+    status,
+    actor,
+  };
+  auditLog.push(entry);
+  if (auditLog.length > AUDIT_LOG_MAX) auditLog.splice(0, auditLog.length - AUDIT_LOG_MAX);
+  jobLogger({ route, method, status }).info('admin action');
+  return entry;
+}
+
+/** Most-recent-first page of recorded /admin/* actions, following
+ * listTransactions()'s limit/offset pagination shape. */
+export async function listAuditLog({ limit = 50, offset = 0 } = {}) {
+  const recent = auditLog.slice().reverse();
+  return {
+    total: recent.length,
+    entries: recent.slice(offset, offset + limit),
+  };
+}
 
 /** Most-recent-first page of every job this backend has ever created,
  * regardless of payer/worker — the admin analogue of the payer-scoped
