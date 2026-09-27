@@ -1,3 +1,4 @@
+import { StrKey } from '@stellar/stellar-sdk';
 import { getKnownJobIds, getJob } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions } from './payerIndex.js';
@@ -33,7 +34,7 @@ export async function listWorkers() {
   return Promise.all(
     ids.map(async (workerId) => {
       const rep = await getReputation(workerId);
-      const isAddress = workerId.startsWith('G') && workerId.length === 56;
+      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
       const [stakeStroops, owedStroops] = isAddress
         ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
         : [0n, 0n];

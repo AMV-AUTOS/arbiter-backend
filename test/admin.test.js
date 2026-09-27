@@ -57,6 +57,25 @@ test('listWorkers reports reputation for a non-address workerId without touching
   assert.equal(row.stake, '0.0000000'); // non-address id: chain reads are skipped, defaults to 0
 });
 
+test('listWorkers treats a 56-char G-prefixed but invalid-checksum id as a non-address', async () => {
+  // 56 chars, starts with 'G', but not a valid base32/checksum Ed25519 public key.
+  const pseudoAddress = `G${'A'.repeat(55)}`;
+  assert.equal(pseudoAddress.length, 56);
+  assert.ok(pseudoAddress.startsWith('G'));
+
+  await recordOutcome(pseudoAddress, true);
+
+  const workers = await listWorkers();
+  const row = workers.find((w) => w.workerId === pseudoAddress);
+  assert.ok(row, 'worker with a recorded outcome should appear in listWorkers');
+  assert.equal(row.totalAnswers, 1);
+  assert.equal(row.matched, 1);
+  // Invalid checksum: StrKey.isValidEd25519PublicKey() is false, so the
+  // on-chain stake read is skipped and defaults to 0 rather than being
+  // attempted and silently swallowed by the surrounding .catch(() => 0n).
+  assert.equal(row.stake, '0.0000000');
+});
+
 test('listPayers aggregates a payer\'s tracked questions', async () => {
   const payerAddress = uniqueId('GPAYER');
   const questionId = uniqueId('q');
