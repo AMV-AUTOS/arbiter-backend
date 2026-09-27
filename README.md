@@ -186,3 +186,8 @@ backend.
 Load-test tooling (`scripts/loadtest.js`), measured limits, and the current
 bottleneck (serialized on-chain settlement) are in
 [docs/capacity/README.md](docs/capacity/README.md).
+
+## Handsoff notes
+
+<!-- handsoff-issue-25 -->
+- #25: Publish an OpenAPI reference for the backend's ~35-route HTTP API surface
