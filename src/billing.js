@@ -57,17 +57,57 @@ export async function getCreditBalanceStroops(accountId) {
  * refunding the difference via settleReservation(), means the ledger can
  * never go negative and a customer can never be charged more than their
  * balance covers, without needing to predict the exact price in advance.
+ *
+ * The reservation is recorded durably (keyed by questionId) BEFORE the
+ * on-chain charge runs, so a crash between askMetered() and
+ * settleReservation() leaves a recoverable "pending reservation" record
+ * instead of a permanently over-debited balance — see
+ * reconcilePendingReservations().
  */
-export async function reserveCredit(accountId, maxStroops) {
-  return store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+export async function reserveCredit(accountId, maxStroops, questionId) {
+  const ok = await store.decrIfAtLeast(`credit:${accountId}`, maxStroops);
+  if (ok && questionId) {
+    await store.set(`reservation:${questionId}`, {
+      accountId,
+      reservedStroops: maxStroops,
+      questionId,
+      createdAt: Date.now(),
+    });
+  }
+  return ok;
 }
 
 /** Credits back the unused portion of a reservation. Pass actualStroops=0
  * to refund the reservation in full (the downstream charge failed
- * entirely — e.g. the pooled on-chain balance itself was insufficient). */
-export async function settleReservation(accountId, reservedStroops, actualStroops) {
+ * entirely — e.g. the pooled on-chain balance itself was insufficient).
+ * Clears the durable pending-reservation record so reconciliation never
+ * revisits a settled reservation. */
+export async function settleReservation(accountId, reservedStroops, actualStroops, questionId) {
   const refund = reservedStroops - actualStroops;
   if (refund > 0) await store.incrBy(`credit:${accountId}`, refund);
+  if (questionId) await store.del(`reservation:${questionId}`);
+}
+
+/**
+ * Startup/periodic reconciliation for the crash window between
+ * reserveCredit() and settleReservation(). For each pending reservation:
+ *  - if the associated job already recorded a final amountStroops, settle
+ *    against that real charge (refunding the unused difference);
+ *  - if no job was ever created, refund the reservation in full.
+ * `getJob` is injected (jobs.js) to avoid a circular import; it returns the
+ * job record or null. Idempotent: settleReservation() deletes the record.
+ */
+export async function reconcilePendingReservations(getJob) {
+  const keys = await store.keys('reservation:*');
+  for (const key of keys) {
+    const reservation = await store.get(key);
+    if (!reservation) continue;
+    const { accountId, reservedStroops, questionId } = reservation;
+    const job = getJob ? await getJob(questionId) : null;
+    const actualStroops = job && Number.isFinite(job.amountStroops) ? job.amountStroops : 0;
+    await settleReservation(accountId, reservedStroops, actualStroops, questionId);
+    logger.info({ questionId, accountId, actualStroops }, 'reconciled abandoned credit reservation');
+  }
 }
 
 /** Creates a fresh account (and its one API key) and a Stripe Checkout
