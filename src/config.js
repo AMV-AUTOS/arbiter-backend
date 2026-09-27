@@ -59,6 +59,41 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
+// Data-retention policy engine (#128). Retention is declared per data type
+// (identified by its store key prefix), not as a single global TTL — the
+// modules that own each prefix have different durability requirements.
+//
+// `ttlMs` is the age at which a record becomes eligible for the sweep to
+// purge. `null` means durable: the sweep will never touch it. Durable is the
+// default for every prefix, and reputation/payer records are explicitly
+// durable because deleting them would silently reset a worker's established
+// status and weaken the sybil-resistance math in dispatch.js/reconcile.js.
+// Aging those out is an explicit opt-in per data type, never a default.
+export const RETENTION_POLICY = Object.freeze({
+  // Job records already expire via config.jobResultTtlMs.
+  'job:': Object.freeze({ ttlMs: num(process.env.RETENTION_JOB_TTL_MS, 3_600_000) }),
+  // Pending-question stash already expires via config.pendingQuestionTtlMs.
+  'pending-question:': Object.freeze({ ttlMs: num(process.env.RETENTION_PENDING_QUESTION_TTL_MS, 600_000) }),
+  // Durable by design — see dispatch.js's isEstablishedWorker().
+  'rep:': Object.freeze({ ttlMs: null }),
+  // Durable by design — payer question history backs reconcile.js.
+  'payer-questions:': Object.freeze({ ttlMs: null }),
+  // Durable by design — anchor records are audit trail.
+  'anchor-tx:': Object.freeze({ ttlMs: null }),
+  'anchor-kyc:': Object.freeze({ ttlMs: null }),
+});
+
+// Resolves the retention rule for a store key by its prefix. Unknown
+// prefixes are durable (never swept) — a new data type must opt in to
+// expiry explicitly rather than inherit a default that could delete it.
+export function retentionRuleFor(key) {
+  if (typeof key !== 'string') return null;
+  for (const prefix of Object.keys(RETENTION_POLICY)) {
+    if (key.startsWith(prefix)) return RETENTION_POLICY[prefix];
+  }
+  return null;
+}
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
@@ -108,6 +143,14 @@ export const config = Object.freeze({
 
   pendingQuestionTtlMs: num(process.env.PENDING_QUESTION_TTL_MS, 600_000),
   jobResultTtlMs: num(process.env.JOB_RESULT_TTL_MS, 3_600_000),
+
+  // Retention sweep (#128). Mirrors dispatch.js's sweepWorkerTtls() shape:
+  // a daily unref()'d setInterval that is explicitly skipped when
+  // unconfigured ("don't pay for what isn't wired up"). Off by default.
+  retention: Object.freeze({
+    enabled: process.env.RETENTION_SWEEP_ENABLED === 'true',
+    intervalMs: num(process.env.RETENTION_SWEEP_INTERVAL_MS, 86_400_000),
+  }),
 
   redisUrl: process.env.REDIS_URL || '',
 
@@ -163,118 +206,6 @@ export const config = Object.freeze({
       max: num(process.env.ANSWER_RATE_LIMIT_MAX, 60),
       windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
-    // Sandbox mode is free (no real payment), so it needs its own — more
-    // generous, but still real — limit rather than sharing the paid-flow
-    // 'oracle' bucket, and rather than being unlimited.
-    sandbox: Object.freeze({
-      max: num(process.env.SANDBOX_RATE_LIMIT_MAX, 30),
-      windowMs: num(process.env.SANDBOX_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    push: Object.freeze({
-      max: num(process.env.PUSH_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.PUSH_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    billing: Object.freeze({
-      max: num(process.env.BILLING_RATE_LIMIT_MAX, 10),
-      windowMs: num(process.env.BILLING_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-    webhooks: Object.freeze({
-      max: num(process.env.WEBHOOKS_RATE_LIMIT_MAX, 20),
-      windowMs: num(process.env.WEBHOOKS_RATE_LIMIT_WINDOW_MS, 60_000),
-    }),
-  }),
+    //
 
-  vapid: Object.freeze({
-    publicKey: process.env.VAPID_PUBLIC_KEY || '',
-    privateKey: process.env.VAPID_PRIVATE_KEY || '',
-    subject: process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
-  }),
-
-  push: Object.freeze({
-    // Push notifications supplement, never replace, the SSE dispatch
-    // channel — they're for workers who aren't currently connected. A
-    // push round-trip (deliver -> notice -> tap -> app loads) realistically
-    // takes several seconds, so notifying for a very short quorum window
-    // (e.g. the 'express' tier's 12s) would routinely arrive after the
-    // window already closed. Below this threshold, skip push entirely
-    // rather than notify workers for an opportunity they can't act on.
-    minTimeoutForPushMs: num(process.env.PUSH_MIN_TIMEOUT_MS, 20_000),
-  }),
-
-  session: Object.freeze({
-    secret: SESSION_SECRET,
-    // How long a worker's session (proven once via a signed challenge
-    // transaction) stays valid before they'd need to re-authenticate.
-    ttlMs: num(process.env.WORKER_SESSION_TTL_MS, 12 * 60 * 60 * 1000),
-    // Graceful rotation: the set of secrets currently valid for verifying a
-    // session token (current first, then the prior secret while the grace
-    // window is open). Verification must accept a match from any of these;
-    // signing always uses `secret`. Empty/absent previous secret or a 0
-    // grace window yields a single-element list — identical to today.
-    secrets: sessionSecrets,
-    // Length of the rotation grace window in ms (0 = disabled).
-    rotationGraceMs: SESSION_SECRET_ROTATION_GRACE_MS,
-  }),
-
-  // Single shared operator secret for the /admin/* console — this codebase
-  // has no user-account system anywhere, so a bearer token is consistent
-  // with everything else here. Multi-operator auth is a real follow-up,
-  // not something to invent ahead of need.
-  admin: Object.freeze({
-    token: process.env.ADMIN_TOKEN || '',
-  }),
-
-  // Home domain of the SEP-24/SEP-12 anchor Arbiter integrates with for
-  // fiat rails (bank deposit/withdraw, KYC status). Arbiter is a CLIENT of
-  // this anchor's stellar.toml — it never stores PII or bank details
-  // itself. Unset disables the /anchor/* routes entirely.
-  anchor: Object.freeze({
-    homeDomain: process.env.ANCHOR_HOME_DOMAIN || '',
-  }),
-
-  // The non-crypto onramp (see billing.js): API-key customers pay in fiat
-  // via Stripe and are settled on-chain from ONE pooled balance under this
-  // dedicated identity — deliberately separate from platformSecret/
-  // platformAddress above (which already collects platform fee revenue via
-  // resolve()/refund()), so customer float and fee revenue never commingle
-  // in one account. Unset disables the /billing/* routes and the API-key
-  // branch of POST /oracle entirely (same fail-closed-if-unconfigured
-  // posture as admin.token above).
-  billing: Object.freeze({
-    stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
-    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
-    fiatPoolSecret: process.env.FIAT_POOL_SECRET || '',
-    fiatPoolAddress: process.env.FIAT_POOL_ADDRESS || '',
-    // 1 USD = 1 USDC face value, at USDC's existing 7-decimal stroop
-    // convention (see pricing.js's stroopsToUsdc) — the simplest possible
-    // conversion for v1. Stripe's own processing fee is absorbed by the
-    // platform, not passed through to the credited balance; revisit if
-    // margin matters before volume does.
-    usdToStroops: 10_000_000n,
-    minTopupUsd: num(process.env.MIN_TOPUP_USD, 10),
-  }),
-
-  // Settlement webhooks (see webhooks.js for registration/validation and
-  // webhookDelivery.js for signing/retry). Delivery is best-effort and
-  // never on the settlement path; these bound how hard it tries.
-  webhooks: Object.freeze({
-    maxPerOwner: num(process.env.WEBHOOK_MAX_PER_OWNER, 10),
-    // Total delivery attempts per event, including the first one.
-    maxAttempts: num(process.env.WEBHOOK_MAX_ATTEMPTS, 6),
-    // Backoff before retry n is baseDelayMs * 2^(n-1) plus up to 20%
-    // jitter: 5s, 10s, 20s, 40s, 80s by default, about 2.5 minutes in all.
-    retryBaseDelayMs: num(process.env.WEBHOOK_RETRY_BASE_DELAY_MS, 5_000),
-    timeoutMs: num(process.env.WEBHOOK_TIMEOUT_MS, 10_000),
-    // Local development / tests only: also accept http:// URLs and
-    // loopback/private-network targets. Never enable in production, since
-    // it turns webhook registration into an SSRF primitive against the
-    // backend's own network.
-    allowInsecureTargets: process.env.WEBHOOK_ALLOW_INSECURE_TARGETS === 'true',
-    // Optional key (any string; it's hashed to 32 bytes) used to encrypt
-    // signing secrets at rest with AES-256-GCM. Secrets must stay
-    // recoverable, since signing needs the plaintext, so they can't be
-    // hashed like API keys. Without a key they're stored as-is, which is the
-    // same trust level as the store itself.
-    secretEncryptionKey: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY || '',
-  }),
-});
+/* … truncated 5869 chars — edit only what you need near the top … */
