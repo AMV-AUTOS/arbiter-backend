@@ -189,8 +189,5 @@ bottleneck (serialized on-chain settlement) are in
 
 ## Handsoff notes
 
-<!-- handsoff-issue-25 -->
-- #25: Publish an OpenAPI reference for the backend's ~35-route HTTP API surface
-
-<!-- handsoff-issue-30 -->
-- #30: Internal Horizon/Soroban error messages are returned verbatim to clients on four routes
+<!-- handsoff-issue-62 -->
+- #62: sponsor.js has no gasless relay for unstake() or withdraw_balance() — the zero-XLM promise is only half-built

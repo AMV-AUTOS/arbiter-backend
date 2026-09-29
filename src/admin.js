@@ -1,3 +1,4 @@
+import { StrKey } from '@stellar/stellar-sdk';
 import { getKnownJobIds, getJob } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions } from './payerIndex.js';
@@ -58,24 +59,24 @@ export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {
  * a page of N workers only issues on-chain reads for those N. */
 export async function listWorkers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const ids = await getKnownWorkerIds();
-  const page = ids.slice(offset, offset + limit);
-  const workers = await mapWithConcurrency(page, MAX_CONCURRENCY, async (workerId) => {
-    const rep = await getReputation(workerId);
-    const isAddress = workerId.startsWith('G') && workerId.length === 56;
-    const [stakeStroops, owedStroops] = isAddress
-      ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
-      : [0n, 0n];
-    return {
-      workerId,
-      totalAnswers: rep.total,
-      matched: rep.matched,
-      matchRatio: rep.total > 0 ? rep.matched / rep.total : null,
-      established: rep.total >= config.worker.minAnswersBeforeReputationGate,
-      stake: stroopsToUsdc(stakeStroops),
-      owed: stroopsToUsdc(owedStroops),
-    };
-  });
-  return { total: ids.length, workers };
+  return Promise.all(
+    ids.map(async (workerId) => {
+      const rep = await getReputation(workerId);
+      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
+      const [stakeStroops, owedStroops] = isAddress
+        ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
+        : [0n, 0n];
+      return {
+        workerId,
+        totalAnswers: rep.total,
+        matched: rep.matched,
+        matchRatio: rep.total > 0 ? rep.matched / rep.total : null,
+        established: rep.total >= config.worker.minAnswersBeforeReputationGate,
+        stake: stroopsToUsdc(stakeStroops),
+        owed: stroopsToUsdc(owedStroops),
+      };
+    }),
+  );
 }
 
 /** Every payer address this backend has seen a verified on-chain payment

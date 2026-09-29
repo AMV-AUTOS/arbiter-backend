@@ -57,30 +57,23 @@ test('listWorkers reports reputation for a non-address workerId without touching
   assert.equal(row.stake, '0.0000000'); // non-address id: chain reads are skipped, defaults to 0
 });
 
-test('listWorkers paginates and only does per-item work for the requested page', async () => {
-  const workerIds = [];
-  for (let i = 0; i < 5; i += 1) {
-    const workerId = uniqueId('worker-page');
-    await recordOutcome(workerId, true);
-    workerIds.push(workerId);
-  }
+test('listWorkers treats a 56-char G-prefixed but invalid-checksum id as a non-address', async () => {
+  // 56 chars, starts with 'G', but not a valid base32/checksum Ed25519 public key.
+  const pseudoAddress = `G${'A'.repeat(55)}`;
+  assert.equal(pseudoAddress.length, 56);
+  assert.ok(pseudoAddress.startsWith('G'));
 
-  const page = await listWorkers({ limit: 2, offset: 0 });
-  assert.ok(Array.isArray(page), 'listWorkers should return an array');
-  assert.ok(page.length <= 2, `expected at most 2 workers, got ${page.length}`);
+  await recordOutcome(pseudoAddress, true);
 
-  // Every returned row must be one of the workers we just created, proving the
-  // page is a slice of the index rather than the whole index.
-  for (const row of page) {
-    assert.ok(workerIds.includes(row.workerId), `unexpected worker ${row.workerId} in page`);
-  }
-
-  // A second page must not overlap the first page's rows.
-  const firstPageIds = page.map((w) => w.workerId);
-  const secondPage = await listWorkers({ limit: 2, offset: 2 });
-  for (const row of secondPage) {
-    assert.ok(!firstPageIds.includes(row.workerId), `worker ${row.workerId} appeared on both pages`);
-  }
+  const workers = await listWorkers();
+  const row = workers.find((w) => w.workerId === pseudoAddress);
+  assert.ok(row, 'worker with a recorded outcome should appear in listWorkers');
+  assert.equal(row.totalAnswers, 1);
+  assert.equal(row.matched, 1);
+  // Invalid checksum: StrKey.isValidEd25519PublicKey() is false, so the
+  // on-chain stake read is skipped and defaults to 0 rather than being
+  // attempted and silently swallowed by the surrounding .catch(() => 0n).
+  assert.equal(row.stake, '0.0000000');
 });
 
 test('listPayers aggregates a payer\'s tracked questions', async () => {

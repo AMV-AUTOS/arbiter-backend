@@ -2,7 +2,13 @@ import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
 
 function num(v, d) {
-  return v === undefined || v === '' ? d : Number(v);
+  if (v === undefined || v === '') return d;
+  const n = Number(v);
+  if (!Number.isFinite(n)) {
+    console.warn(`[config] ignoring malformed numeric value ${JSON.stringify(v)} — falling back to default ${d}`);
+    return d;
+  }
+  return n;
 }
 
 // Express's `trust proxy` setting (see server.js's app.set('trust proxy', ...)).
@@ -210,5 +216,3 @@ export const config = Object.freeze({
       windowMs: num(process.env.ANSWER_RATE_LIMIT_WINDOW_MS, 60_000),
     }),
     //
-
-/* … truncated 5869 chars — edit only what you need near the top … */
