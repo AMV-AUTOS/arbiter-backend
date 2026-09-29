@@ -57,6 +57,32 @@ test('listWorkers reports reputation for a non-address workerId without touching
   assert.equal(row.stake, '0.0000000'); // non-address id: chain reads are skipped, defaults to 0
 });
 
+test('listWorkers paginates and only does per-item work for the requested page', async () => {
+  const workerIds = [];
+  for (let i = 0; i < 5; i += 1) {
+    const workerId = uniqueId('worker-page');
+    await recordOutcome(workerId, true);
+    workerIds.push(workerId);
+  }
+
+  const page = await listWorkers({ limit: 2, offset: 0 });
+  assert.ok(Array.isArray(page), 'listWorkers should return an array');
+  assert.ok(page.length <= 2, `expected at most 2 workers, got ${page.length}`);
+
+  // Every returned row must be one of the workers we just created, proving the
+  // page is a slice of the index rather than the whole index.
+  for (const row of page) {
+    assert.ok(workerIds.includes(row.workerId), `unexpected worker ${row.workerId} in page`);
+  }
+
+  // A second page must not overlap the first page's rows.
+  const firstPageIds = page.map((w) => w.workerId);
+  const secondPage = await listWorkers({ limit: 2, offset: 2 });
+  for (const row of secondPage) {
+    assert.ok(!firstPageIds.includes(row.workerId), `worker ${row.workerId} appeared on both pages`);
+  }
+});
+
 test('listPayers aggregates a payer\'s tracked questions', async () => {
   const payerAddress = uniqueId('GPAYER');
   const questionId = uniqueId('q');
@@ -68,6 +94,24 @@ test('listPayers aggregates a payer\'s tracked questions', async () => {
   assert.ok(row, 'payer should appear in listPayers');
   assert.equal(row.totalTracked, 1);
   assert.equal(row.settled, 1);
+});
+
+test('listPayers paginates the tracked payer index', async () => {
+  const payerAddresses = [];
+  for (let i = 0; i < 5; i += 1) {
+    const payerAddress = uniqueId('GPAYER-page');
+    const questionId = uniqueId('q');
+    await createJob(questionId, { amountStroops: '1000000' });
+    await recordPayerQuestion(payerAddress, questionId);
+    payerAddresses.push(payerAddress);
+  }
+
+  const page = await listPayers({ limit: 2, offset: 0 });
+  assert.ok(Array.isArray(page), 'listPayers should return an array');
+  assert.ok(page.length <= 2, `expected at most 2 payers, got ${page.length}`);
+  for (const row of page) {
+    assert.ok(payerAddresses.includes(row.payerAddress), `unexpected payer ${row.payerAddress} in page`);
+  }
 });
 
 test('getFeeRevenue sums the platform\'s 20% cut only over settled+resolved jobs', async () => {

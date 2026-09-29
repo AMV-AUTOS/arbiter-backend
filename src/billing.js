@@ -4,6 +4,7 @@ import { store } from './store.js';
 import { config } from './config.js';
 import { hashApiKey } from './apiKeyAuth.js';
 import { logger } from './logger.js';
+import { withRetry } from './retry.js';
 
 /**
  * The non-crypto onramp: a fiat customer pays via Stripe and is issued an
@@ -16,9 +17,19 @@ import { logger } from './logger.js';
  * itself.
  */
 
+/**
+ * Bounded retry/timeout policy for the outbound Stripe checkout call,
+ * matching the shape of HORIZON_RETRY_OPTS in sponsor.js. The Stripe SDK's
+ * own network retry is disabled (maxNetworkRetries: 0) so this is the
+ * single, uniform retry loop for the call — the same choice round 5 made
+ * for Claude in reconcile.js's getClient(), rather than layering a second,
+ * redundant retry loop on top of the SDK's default.
+ */
+const STRIPE_RETRY_OPTS = { attempts: 2, timeoutMs: 8000, label: 'stripe.checkout.sessions.create' };
+
 let stripeClient = null;
 function getStripe() {
-  if (!stripeClient) stripeClient = new Stripe(config.billing.stripeSecretKey);
+  if (!stripeClient) stripeClient = new Stripe(config.billing.stripeSecretKey, { maxNetworkRetries: 0 });
   return stripeClient;
 }
 
@@ -111,22 +122,25 @@ export async function createCheckoutSession(amountUsd, successUrl, cancelUrl) {
   }
 
   const { accountId, rawKey } = await createAccount();
-  const session = await getStripe().checkout.sessions.create({
-    mode: 'payment',
-    line_items: [
-      {
-        price_data: {
-          currency: 'usd',
-          product_data: { name: 'Arbiter API credit' },
-          unit_amount: Math.round(amountUsd * 100),
+  const session = await withRetry(
+    () => getStripe().checkout.sessions.create({
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: 'Arbiter API credit' },
+            unit_amount: Math.round(amountUsd * 100),
+          },
+          quantity: 1,
         },
-        quantity: 1,
-      },
-    ],
-    metadata: { accountId },
-    success_url: `${successUrl}?apiKey=${rawKey}`,
-    cancel_url: cancelUrl,
-  });
+      ],
+      metadata: { accountId },
+      success_url: `${successUrl}?apiKey=${rawKey}`,
+      cancel_url: cancelUrl,
+    }),
+    STRIPE_RETRY_OPTS,
+  );
 
   return { checkoutUrl: session.url };
 }

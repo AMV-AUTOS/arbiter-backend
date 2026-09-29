@@ -84,6 +84,20 @@ export function validateWebhookRetryPolicy(policy) {
   return { attempts, baseDelayMs };
 }
 
+// Comma-separated list of operator bearer tokens for the /admin/* console.
+// ADMIN_TOKENS is the multi-operator form; the legacy single ADMIN_TOKEN is
+// folded into the same list so existing single-token deployments keep
+// working unchanged. This is still not per-operator *identity* — a request
+// authenticated with any valid token is indistinguishable from any other
+// (no audit-by-who). Revoking one operator's access means removing their
+// specific token value from the list and redistributing the (unchanged)
+// remaining tokens to everyone still using them, not a from-scratch
+// rotation for the whole team.
+const adminTokens = [
+  ...(process.env.ADMIN_TOKENS || '').split(',').map((s) => s.trim()).filter(Boolean),
+  ...(process.env.ADMIN_TOKEN || '').split(',').map((s) => s.trim()).filter(Boolean),
+];
+
 export const config = Object.freeze({
   port: num(process.env.PORT, 4000),
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
