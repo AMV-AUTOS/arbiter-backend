@@ -89,6 +89,24 @@ test('listPayers aggregates a payer\'s tracked questions', async () => {
   assert.equal(row.settled, 1);
 });
 
+test('listPayers paginates the tracked payer index', async () => {
+  const payerAddresses = [];
+  for (let i = 0; i < 5; i += 1) {
+    const payerAddress = uniqueId('GPAYER-page');
+    const questionId = uniqueId('q');
+    await createJob(questionId, { amountStroops: '1000000' });
+    await recordPayerQuestion(payerAddress, questionId);
+    payerAddresses.push(payerAddress);
+  }
+
+  const page = await listPayers({ limit: 2, offset: 0 });
+  assert.ok(Array.isArray(page), 'listPayers should return an array');
+  assert.ok(page.length <= 2, `expected at most 2 payers, got ${page.length}`);
+  for (const row of page) {
+    assert.ok(payerAddresses.includes(row.payerAddress), `unexpected payer ${row.payerAddress} in page`);
+  }
+});
+
 test('getFeeRevenue sums the platform\'s 20% cut only over settled+resolved jobs', async () => {
   const resolvedId = uniqueId('q-resolved');
   const refundedId = uniqueId('q-refunded');
