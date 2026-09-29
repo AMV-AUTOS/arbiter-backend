@@ -2,7 +2,38 @@ import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
 
 function num(v, d) {
-  return v === undefined || v === '' ? d : Number(v);
+  if (v === undefined || v === '') return d;
+  const n = Number(v);
+  if (!Number.isFinite(n)) {
+    console.warn(`[config] ignoring malformed numeric value ${JSON.stringify(v)} — falling back to default ${d}`);
+    return d;
+  }
+  return n;
+}
+
+// Express's `trust proxy` setting (see server.js's app.set('trust proxy', ...)).
+// Without it, req.ip is always the immediate TCP peer address — behind a
+// reverse proxy (Railway, nginx, a load balancer) that's the proxy's own
+// address, so every per-IP rate limit in config.rateLimits and the SSE
+// anti-sybil connection limit in dispatch.js collapse into one shared bucket.
+//
+// Defaults to false (trust nothing) so local dev is unchanged: req.ip is the
+// raw socket address. For a real deployment, set TRUST_PROXY to the number of
+// proxy hops in front of this process — typically `1` behind Railway (which
+// terminates and proxies every connection exactly once). Never set this to
+// `true`/`*` blindly: that trusts a client-supplied X-Forwarded-For header,
+// letting any caller mint an independent rate-limit bucket per request.
+function trustProxy() {
+  const raw = process.env.TRUST_PROXY;
+  if (raw === undefined || raw === '') return false;
+  const trimmed = raw.trim();
+  if (trimmed === 'true') return true;
+  if (trimmed === 'false') return false;
+  const hops = Number(trimmed);
+  if (Number.isInteger(hops) && hops >= 0) return hops;
+  // Anything else (a CIDR list, a named subnet, etc.) is passed through to
+  // Express verbatim — it accepts those forms too.
+  return trimmed;
 }
 
 // Falls back to a random per-process secret if unset — sessions won't
@@ -158,6 +189,13 @@ export const config = Object.freeze({
   // "https://app.example.com,https://demo.example.com". Defaults to '*'
   // (wide open) for local dev — lock this down for any real deployment.
   allowedOrigins: (process.env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
+
+  // Express `trust proxy` value, applied in server.js before any rate-limited
+  // route registers. false (default) = trust nothing, req.ip is the raw
+  // socket address (unchanged local-dev behavior). Behind Railway set
+  // TRUST_PROXY=1 (exactly one proxy hop). See trustProxy() above for why
+  // `true` is dangerous here.
+  trustProxy: trustProxy(),
 
   // 'json' for real deployments (log aggregators parse JSON lines
   // directly); anything else pretty-prints for local dev readability.

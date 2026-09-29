@@ -1,3 +1,4 @@
+import { StrKey } from '@stellar/stellar-sdk';
 import { getKnownJobIds, getJob } from './jobs.js';
 import { getKnownWorkerIds, getReputation } from './dispatch.js';
 import { getKnownPayerAddresses, getPayerQuestionIds, summarizePayerQuestions } from './payerIndex.js';
@@ -50,7 +51,7 @@ export async function listAuditLog({ limit = 50, offset = 0 } = {}) {
 /** Most-recent-first page of every job this backend has ever created,
  * regardless of payer/worker — the admin analogue of the payer-scoped
  * /payers/:address/questions and worker-scoped leaderboard views. */
-export async function listTransactions({ limit = 50, offset = 0 } = {}) {
+export async function listTransactions({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const ids = await getKnownJobIds();
   const page = ids.slice(offset, offset + limit);
   const jobs = await Promise.all(page.map((id) => getJob(id)));
@@ -64,13 +65,15 @@ export async function listTransactions({ limit = 50, offset = 0 } = {}) {
  * reputation (off-chain) and stake/owed (read live from the contract) —
  * unlike leaderboard.js's getLeaderboard(), this deliberately includes
  * non-established workers too, since an operator needs to see the whole
- * roster, not just the ones good enough to rank publicly. */
-export async function listWorkers() {
+ * roster, not just the ones good enough to rank publicly. Paginated like
+ * listTransactions(): the id list is sliced *before* any per-item work, so
+ * a page of N workers only issues on-chain reads for those N. */
+export async function listWorkers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const ids = await getKnownWorkerIds();
   return Promise.all(
     ids.map(async (workerId) => {
       const rep = await getReputation(workerId);
-      const isAddress = workerId.startsWith('G') && workerId.length === 56;
+      const isAddress = StrKey.isValidEd25519PublicKey(workerId);
       const [stakeStroops, owedStroops] = isAddress
         ? await Promise.all([getStakeOnChain(workerId).catch(() => 0n), getOwedOnChain(workerId).catch(() => 0n)])
         : [0n, 0n];
@@ -89,23 +92,24 @@ export async function listWorkers() {
 
 /** Every payer address this backend has seen a verified on-chain payment
  * from, with the same spend/success aggregation the buyer dashboard shows
- * that payer about themselves (payerIndex.js's summarizePayerQuestions). */
-export async function listPayers() {
+ * that payer about themselves (payerIndex.js's summarizePayerQuestions).
+ * Paginated like listTransactions(): slice before per-item work. */
+export async function listPayers({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const addresses = await getKnownPayerAddresses();
-  return Promise.all(
-    addresses.map(async (payerAddress) => {
-      const ids = await getPayerQuestionIds(payerAddress);
-      const jobs = await Promise.all(ids.map((id) => getJob(id)));
-      const summary = summarizePayerQuestions(ids, jobs);
-      return {
-        payerAddress,
-        totalTracked: summary.totalTracked,
-        totalSpend: stroopsToUsdc(summary.totalSpendStroops),
-        settled: summary.settled,
-        successRate: summary.successRate,
-      };
-    }),
-  );
+  const page = addresses.slice(offset, offset + limit);
+  const payers = await mapWithConcurrency(page, MAX_CONCURRENCY, async (payerAddress) => {
+    const ids = await getPayerQuestionIds(payerAddress);
+    const jobs = await Promise.all(ids.map((id) => getJob(id)));
+    const summary = summarizePayerQuestions(ids, jobs);
+    return {
+      payerAddress,
+      totalTracked: summary.totalTracked,
+      totalSpend: stroopsToUsdc(summary.totalSpendStroops),
+      settled: summary.settled,
+      successRate: summary.successRate,
+    };
+  });
+  return { total: addresses.length, payers };
 }
 
 async function loadUsdcBalances(address) {
@@ -150,7 +154,13 @@ export async function getTreasury() {
  * job this backend has recorded. A derived, historical figure (off-chain
  * bookkeeping over this backend's own job records) — the live treasury
  * balance above is the on-chain-verifiable ground truth; this is "how much
- * of that did settlement fees, specifically, account for." */
+ * of that did settlement fees, specifically, account for."
+ *
+ * Deliberately a full-index aggregate: it must sum across every job to
+ * report a total, so it can't be paginated. Its cost is bounded to
+ * O(known jobs) *store* reads only — getJob() reads local job metadata and
+ * makes no chain/RPC calls — so this stays cheap even at the 5,000-entry
+ * index cap and needs no concurrency cap or memoization. */
 export async function getFeeRevenue() {
   const ids = await getKnownJobIds();
   const jobs = await Promise.all(ids.map((id) => getJob(id)));
@@ -172,27 +182,30 @@ export async function getFeeRevenue() {
 /** Bank Payouts — self-reported SEP-24 withdrawal history (see
  * anchorRecords.js for why this is a self-reported cache, not a live
  * per-address anchor query: SEP-10 means only the account holder can pull
- * their own transaction history from the anchor). */
-export async function listAnchorPayouts() {
+ * their own transaction history from the anchor). Paginated like
+ * listTransactions(): slice before per-item work. */
+export async function listAnchorPayouts({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const addresses = await getKnownAnchorAddresses();
-  const rows = await Promise.all(
-    addresses.map(async (address) => {
-      const txs = await getAnchorTransactions(address);
-      return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
-    }),
-  );
-  return rows.flat().sort((a, b) => b.reportedAt - a.reportedAt);
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const txs = await getAnchorTransactions(address);
+    return txs.filter((t) => t.kind === 'withdrawal').map((t) => ({ address, ...t }));
+  });
+  return {
+    total: addresses.length,
+    payouts: rows.flat().sort((a, b) => b.reportedAt - a.reportedAt),
+  };
 }
 
 /** KYC & Tiers — self-reported SEP-12 customer status per address, same
- * caveat as listAnchorPayouts(). */
-export async function listAnchorKyc() {
+ * caveat as listAnchorPayouts(). Paginated like listTransactions(): slice
+ * before per-item work. */
+export async function listAnchorKyc({ limit = DEFAULT_LIMIT, offset = 0 } = {}) {
   const addresses = await getKnownAnchorAddresses();
-  const rows = await Promise.all(
-    addresses.map(async (address) => {
-      const kyc = await getAnchorKyc(address);
-      return kyc ? { address, ...kyc } : null;
-    }),
-  );
-  return rows.filter(Boolean);
+  const page = addresses.slice(offset, offset + limit);
+  const rows = await mapWithConcurrency(page, MAX_CONCURRENCY, async (address) => {
+    const kyc = await getAnchorKyc(address);
+    return kyc ? { address, ...kyc } : null;
+  });
+  return { total: addresses.length, kyc: rows.filter(Boolean) };
 }
